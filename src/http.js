@@ -116,6 +116,10 @@ function createHandler(service) {
           send(response, 201, service.createSession(id, await readBody(request), key));
           return;
         }
+        if (method === 'POST' && parts.length === 3 && parts[2] === 'spectators') {
+          send(response, 201, service.createSpectator(id, await readBody(request), key));
+          return;
+        }
         if (parts.length === 5 && parts[2] === 'sessions') {
           const sessionId = decodeURIComponent(parts[3]);
           const action = parts[4];
@@ -129,6 +133,13 @@ function createHandler(service) {
           }
           if (method === 'POST' && action === 'resume') {
             send(response, 200, service.resumeSession(id, sessionId, await readBody(request), key));
+            return;
+          }
+        }
+        if (parts.length === 5 && parts[2] === 'spectators') {
+          const spectatorId = decodeURIComponent(parts[3]);
+          if (method === 'POST' && parts[4] === 'poll') {
+            send(response, 200, service.pollSpectator(id, spectatorId, await readBody(request), key));
             return;
           }
         }

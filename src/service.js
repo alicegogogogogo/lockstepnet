@@ -21,6 +21,9 @@ function requestHash(body) {
   return createHash('sha256').update(canonicalJson(body)).digest('hex');
 }
 
+/** A spectator stream may trail the live frontier by at most this many ticks. */
+const MAX_SPECTATOR_DELAY = 1024;
+
 /**
  * LockstepNet service: deterministic lockstep simulation with rollback replay.
  *
@@ -509,6 +512,173 @@ class Lockstep {
     });
   }
 
+  /** Load a match's spectator or fail with 404; never returns null. */
+  requireSpectator(matchId, spectatorId) {
+    this.match(matchId);
+    const spectator = this.store.readSpectator(matchId, spectatorId);
+    if (!spectator) {
+      throw new NotFoundError(`spectator ${spectatorId} of match ${matchId} was not found`);
+    }
+    return spectator;
+  }
+
+  /**
+   * The frame a spectator may currently see: the frontier delayed by
+   * `delay_ticks` while a match runs, or the final tick once it has ended. A
+   * finished match is frozen, so its spectators catch up to the very end instead
+   * of trailing forever.
+   */
+  visibleTick(spectator, state) {
+    if (state.status !== 'running') {
+      return state.tick;
+    }
+    return Math.max(0, state.tick - spectator.delayTicks);
+  }
+
+  /**
+   * Register a spectator: a passive reader that trails the live frontier by
+   * `delay_ticks`. Spectators are bookkeeping only: creating one never advances
+   * the match and never enters a `state_hash` or `replay_hash`.
+   */
+  createSpectator(matchId, raw, key) {
+    const record = this.match(matchId);
+    sim.exactKeys(raw, ['id', 'delay_ticks'], 'body');
+    if (raw.id === undefined || raw.delay_ticks === undefined) {
+      throw new ValidationError('body must contain id and delay_ticks');
+    }
+    const spectatorId = sim.identifier(raw.id, 'spectator id');
+    const delayTicks = sim.integer(raw.delay_ticks, 'delay_ticks', 0, MAX_SPECTATOR_DELAY);
+    return this.idempotent(key, `create-spectator:${matchId}`, raw, () => {
+      if (this.store.readSpectator(matchId, spectatorId)) {
+        throw new ConflictError(`spectator ${spectatorId} already exists for match ${matchId}`);
+      }
+      const spectator = { delayTicks, highWater: 0, id: spectatorId, maxDelivered: 0, reset: false };
+      this.store.insertSpectator(matchId, spectator);
+      const state = this.store.readState(matchId);
+      return {
+        delay_ticks: delayTicks,
+        match_id: matchId,
+        spectator_id: spectatorId,
+        visible_tick: this.visibleTick(spectator, state),
+      };
+    });
+  }
+
+  /**
+   * Poll a spectator's delayed stream.
+   *
+   * In normal `stream` mode the response carries the contiguous recorded frames
+   * strictly after `after_tick` up to the spectator's `visible_tick`, at most
+   * `limit` frames, followed by the state at the end of the returned window.
+   * `complete` is true only when the window reached `visible_tick`.
+   *
+   * When a rollback (a late input or the explicit endpoint) rewrites a frame the
+   * spectator had already received, the spectator is marked for reset: the next
+   * poll ignores `after_tick`, replays from tick 0 in pages of `limit`, and
+   * reports `mode: "reset"` until the reset stream catches back up.
+   */
+  pollSpectator(matchId, spectatorId, raw, key) {
+    const spectator = this.requireSpectator(matchId, spectatorId);
+    sim.exactKeys(raw, ['after_tick', 'limit'], 'body');
+    const afterTick = raw.after_tick === undefined ? 0 : raw.after_tick;
+    if (!Number.isInteger(afterTick) || afterTick < 0) {
+      throw new ValidationError('after_tick must be a non-negative integer');
+    }
+    const limit = raw.limit === undefined ? sim.MAX_STEP : raw.limit;
+    if (!Number.isInteger(limit) || limit < 1 || limit > sim.MAX_STEP) {
+      throw new ValidationError(`limit must be an integer between 1 and ${sim.MAX_STEP}`);
+    }
+    return this.idempotent(key, `poll-spectator:${matchId}:${spectatorId}`, raw, () => {
+      const state = this.store.readState(matchId);
+      const visible = this.visibleTick(spectator, state);
+      if (!spectator.reset && afterTick > visible) {
+        throw new ConflictError(`after_tick ${afterTick} is past the visible tick ${visible}`);
+      }
+
+      let mode = 'stream';
+      let startTick = afterTick;
+      if (spectator.reset) {
+        // A reset replays the whole history from tick 0 in limit-sized pages;
+        // after_tick from the client is discarded. The spectator's high-water
+        // mark, rewound to 0 when the reset was flagged, is the paging cursor.
+        mode = 'reset';
+        startTick = spectator.highWater;
+      }
+
+      const end = Math.min(startTick + limit, visible);
+      const frames = this.spectatorFrames(matchId, startTick, end);
+      const reached = startTick + frames.length;
+
+      let complete;
+      let nextReset = spectator.reset;
+      if (spectator.reset) {
+        complete = reached >= visible;
+        nextReset = !complete;
+      } else {
+        complete = reached >= visible;
+      }
+
+      const updated = {
+        ...spectator,
+        highWater: reached,
+        maxDelivered: Math.max(spectator.maxDelivered, reached),
+        reset: nextReset,
+      };
+      this.store.writeSpectator(matchId, updated);
+
+      return {
+        complete,
+        frames,
+        match_id: matchId,
+        mode,
+        next_tick: reached,
+        spectator_id: spectatorId,
+        state_hash: this.frameHashAt(matchId, reached),
+        team_damage: this.teamDamageAt(matchId, reached, state),
+        units: this.allUnitsAt(matchId, reached, state),
+      };
+    });
+  }
+
+  /**
+   * Contiguous recorded frames with ticks in `(startTick, endTick]`, each
+   * re-derived from the snapshot before the window and checked against its
+   * recorded hash. A gap or a recomputation mismatch is an `integrity_failure`
+   * rather than an inconsistent stream.
+   */
+  spectatorFrames(matchId, startTick, endTick) {
+    if (endTick <= startTick) {
+      return [];
+    }
+    const byTick = new Map();
+    for (const frame of this.store.readFramesFrom(matchId, startTick + 1)) {
+      byTick.set(frame.tick, frame);
+    }
+    const frames = [];
+    for (let tick = startTick + 1; tick <= endTick; tick += 1) {
+      const frame = byTick.get(tick);
+      if (!frame) {
+        throw new IntegrityError(`match ${matchId} is missing recorded frame ${tick}`);
+      }
+      frames.push({
+        casualties: frame.delta.casualties, settled: frame.settled,
+        state_hash: frame.state_hash, tick: frame.tick,
+      });
+    }
+    this.verifyWindow(matchId, startTick, frames);
+    return frames;
+  }
+
+  /** Every unit snapshot as it is at frame `tick`, sorted by unit id. */
+  allUnitsAt(matchId, tick, current) {
+    return this.unitsAt(
+      matchId,
+      this.config(matchId).units.map((unit) => unit.id),
+      tick,
+      current,
+    ).sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+  }
+
   /**
    * Advance a match by `count` ticks (default 1).
    *
@@ -646,6 +816,18 @@ class Lockstep {
     const state = this.snapshotAt(matchId, resumeTick);
     const resumeStatus = state.status;
     this.store.deleteFramesFrom(matchId, resumeTick + 1);
+    // A spectator whose delayed stream already held a frame this rebuild
+    // discards must restart from tick 0. A plain forward advance never reaches
+    // this branch with such a spectator: its visible window lags the frontier,
+    // so its high-water mark cannot pass the old frontier.
+    for (const spectator of this.store.readSpectatorsPast(matchId, resumeTick)) {
+      // Rewind the reset paging cursor to 0 so the replay restarts at tick 0.
+      // The monotonic max-delivered mark is kept: it is what triggered this and
+      // continues to describe how far this spectator has ever seen.
+      spectator.highWater = 0;
+      spectator.reset = true;
+      this.store.writeSpectator(matchId, spectator);
+    }
     const buckets = new Map();
     for (const input of this.store.readInputs(matchId)) {
       const bucket = buckets.get(input.tick);

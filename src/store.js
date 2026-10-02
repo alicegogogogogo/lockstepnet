@@ -51,6 +51,13 @@ const SCHEMA = `
     id TEXT NOT NULL, status TEXT NOT NULL, units_json TEXT NOT NULL,
     PRIMARY KEY (match_id, id)
   );
+  CREATE TABLE IF NOT EXISTS spectators (
+    match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    id TEXT NOT NULL, delay_ticks INTEGER NOT NULL,
+    high_water INTEGER NOT NULL, max_delivered INTEGER NOT NULL,
+    reset INTEGER NOT NULL,
+    PRIMARY KEY (match_id, id)
+  );
   CREATE TABLE IF NOT EXISTS idempotency (
     key TEXT PRIMARY KEY, operation TEXT NOT NULL,
     request_hash TEXT NOT NULL, response_json TEXT NOT NULL
@@ -245,6 +252,47 @@ class Store {
   setSessionStatus(matchId, sessionId, status) {
     this.connection.prepare('UPDATE sessions SET status = ? WHERE match_id = ? AND id = ?')
       .run(status, matchId, sessionId);
+  }
+
+  insertSpectator(matchId, spectator) {
+    this.connection
+      .prepare('INSERT INTO spectators(match_id, id, delay_ticks, high_water, max_delivered, reset) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(
+        matchId, spectator.id, spectator.delayTicks,
+        spectator.highWater, spectator.maxDelivered, spectator.reset ? 1 : 0,
+      );
+  }
+
+  readSpectator(matchId, spectatorId) {
+    const row = this.connection
+      .prepare('SELECT * FROM spectators WHERE match_id = ? AND id = ?')
+      .get(matchId, spectatorId);
+    return row
+      ? {
+        delayTicks: row.delay_ticks, highWater: row.high_water, id: row.id,
+        maxDelivered: row.max_delivered, reset: row.reset === 1,
+      }
+      : null;
+  }
+
+  writeSpectator(matchId, spectator) {
+    this.connection
+      .prepare('UPDATE spectators SET delay_ticks = ?, high_water = ?, max_delivered = ?, reset = ? WHERE match_id = ? AND id = ?')
+      .run(
+        spectator.delayTicks, spectator.highWater, spectator.maxDelivered,
+        spectator.reset ? 1 : 0, matchId, spectator.id,
+      );
+  }
+
+  /** Every spectator that has ever received a frame above tick `tick`. */
+  readSpectatorsPast(matchId, tick) {
+    return this.connection
+      .prepare('SELECT * FROM spectators WHERE match_id = ? AND max_delivered > ?')
+      .all(matchId, tick)
+      .map((row) => ({
+        delayTicks: row.delay_ticks, highWater: row.high_water, id: row.id,
+        maxDelivered: row.max_delivered, reset: row.reset === 1,
+      }));
   }
 
   getIdempotent(key) {

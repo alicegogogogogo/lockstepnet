@@ -345,6 +345,97 @@ new call with the same already-reached state) simply reports that state, so a
 partial catch-up is paged with further `resume` calls. An unknown match is
 `not_found`; an unknown session is also `not_found`.
 
+### Spectators and delay compensation
+
+A spectator is a passive observer that trails the live frontier by a fixed
+number of ticks. Spectators are bookkeeping only, exactly like sessions:
+creating or polling one never advances the match and never enters a
+`state_hash` or `replay_hash`; queries, replay, verification, advancement and
+rollback behave exactly as without them.
+
+```http
+POST /matches/duel-1/spectators
+Idempotency-Key: spectator-cam
+
+{"id":"cam","delay_ticks":4}
+```
+
+The body contains exactly `id` and `delay_ticks`. `id` follows the identifier
+rule and must be unique among the match's spectators (a duplicate is a
+`conflict`); `delay_ticks` is an integer from `0` to `1024`. Returns HTTP 201
+with `spectator_id`, `match_id`, `delay_ticks` and `visible_tick`.
+
+`visible_tick` is the newest frame the spectator may currently see:
+`max(0, tick - delay_ticks)` while the match is `running`. Once the match has
+ended (`red_wins`, `blue_wins` or `max_ticks`) the frontier is frozen, so
+`visible_tick` becomes the final tick and the spectator may catch up to the end.
+
+```http
+POST /matches/duel-1/spectators/cam/poll
+Idempotency-Key: spectator-cam-poll-1
+
+{"after_tick":0,"limit":1024}
+```
+
+The body contains exactly `after_tick` and `limit`; `after_tick` (the last frame
+the caller already holds) defaults to `0` and `limit` defaults to `1024` and is
+an integer from `1` to `1024`. A successful response carries `mode` set to
+`stream`:
+
+```json
+{
+  "spectator_id": "cam",
+  "match_id": "duel-1",
+  "mode": "stream",
+  "frames": [
+    {"tick": 1, "state_hash": "<64 hex>", "settled": true, "casualties": []}
+  ],
+  "next_tick": 5,
+  "units": [
+    {"id":"red-1","team":"red","position":0,"velocity":5,"health":90,"attacking":true,"alive":true}
+  ],
+  "team_damage": {"blue": 0, "red": 10},
+  "state_hash": "<64 hex>",
+  "complete": false
+}
+```
+
+- `frames` are contiguous and in tick order, covering the recorded frames
+  strictly after `after_tick` up to `visible_tick`, at most `limit`; each frame
+  carries `tick`, `state_hash`, `settled` and `casualties` and must reproduce
+  its recorded hash, otherwise the request fails with `integrity_failure`.
+- `next_tick` is one past the last delivered frame and is the `after_tick` of
+  the next poll. `units` lists every unit and `team_damage` the totals as they
+  are at `next_tick`; `state_hash` is the hash of that tick (the initial hash
+  when no frame was delivered).
+- `complete` is `true` only when the window reaches `visible_tick`. When no
+  frame is in the window, the response is the snapshot at `after_tick` with an
+  empty `frames` array.
+- `after_tick` greater than `visible_tick` is a `conflict`.
+
+Polling is a state-changing call (it advances the spectator's paging cursor)
+and requires an `Idempotency-Key`; both spectator POSTs return
+`validation_error` when the header is missing, and reuse of a key for another
+operation or body is a `conflict`.
+
+#### Rollback and the reset stream
+
+If a late input triggers an automatic rollback, or
+`POST /matches/{id}/rollback` rewinds past a frame that a spectator has already
+received (the rollback target is below the spectator's highest delivered
+frame), that part of history is recomputed and the frames the spectator held
+can change. The next poll therefore returns `mode` set to `reset`: it ignores
+`after_tick`, replays the whole match from tick 0 in pages of `limit`, and the
+caller pages through with the returned `next_tick`. Every reset page keeps
+`mode: "reset"`, and `complete` is true once the replay reaches the current
+`visible_tick`; the following poll is a normal `stream` again. A frame that does
+not reproduce its recorded hash during the replay fails the poll with
+`integrity_failure`.
+
+An unknown match or spectator is `not_found`; malformed parameters are
+`validation_error`; a duplicate spectator id or an `after_tick` ahead of the
+visible tick is `conflict`.
+
 ### Replay file format
 
 ```json
