@@ -1,0 +1,15 @@
+{
+  "name": "lockstepnet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deterministic lockstep frame simulation with rollback and replay verification",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "main": "src/service.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test tests/"
+  }
+}
