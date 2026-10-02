@@ -83,6 +83,25 @@ function createHandler(service) {
           send(response, 201, service.submitInputs(id, await readBody(request), key));
           return;
         }
+        if (method === 'POST' && parts.length === 3 && parts[2] === 'sessions') {
+          send(response, 201, service.createSession(id, await readBody(request), key));
+          return;
+        }
+        if (parts.length === 5 && parts[2] === 'sessions') {
+          const sessionId = decodeURIComponent(parts[3]);
+          if (method === 'POST' && parts[4] === 'inputs') {
+            send(response, 201, service.submitSessionInputs(id, sessionId, await readBody(request), key));
+            return;
+          }
+          if (method === 'POST' && parts[4] === 'disconnect') {
+            send(response, 200, service.disconnect(id, sessionId, await readBody(request), key));
+            return;
+          }
+          if (method === 'POST' && parts[4] === 'resume') {
+            send(response, 200, service.resume(id, sessionId, await readBody(request), key));
+            return;
+          }
+        }
         if (method === 'POST' && parts.length === 3 && parts[2] === 'tick') {
           send(response, 200, service.advance(id, await readBody(request), key));
           return;

@@ -46,6 +46,17 @@ const SCHEMA = `
     name TEXT NOT NULL, value INTEGER NOT NULL,
     PRIMARY KEY (match_id, name)
   );
+  CREATE TABLE IF NOT EXISTS sessions (
+    match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    id TEXT NOT NULL, status TEXT NOT NULL,
+    PRIMARY KEY (match_id, id)
+  );
+  CREATE TABLE IF NOT EXISTS session_units (
+    match_id TEXT NOT NULL, unit TEXT NOT NULL, session_id TEXT NOT NULL,
+    PRIMARY KEY (match_id, unit),
+    FOREIGN KEY (match_id, session_id) REFERENCES sessions(match_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (match_id, unit) REFERENCES units(match_id, id) ON DELETE CASCADE
+  );
   CREATE TABLE IF NOT EXISTS idempotency (
     key TEXT PRIMARY KEY, operation TEXT NOT NULL,
     request_hash TEXT NOT NULL, response_json TEXT NOT NULL
@@ -215,6 +226,46 @@ class Store {
     this.connection
       .prepare('INSERT INTO stats(match_id, name, value) VALUES (?, ?, ?) ON CONFLICT(match_id, name) DO UPDATE SET value = value + excluded.value')
       .run(matchId, name, amount);
+  }
+
+  insertSession(matchId, sessionId, units) {
+    this.connection.prepare('INSERT INTO sessions(match_id, id, status) VALUES (?, ?, ?)')
+      .run(matchId, sessionId, 'connected');
+    const claim = this.connection
+      .prepare('INSERT INTO session_units(match_id, unit, session_id) VALUES (?, ?, ?)');
+    for (const unit of units) {
+      claim.run(matchId, unit, sessionId);
+    }
+  }
+
+  readSession(matchId, sessionId) {
+    const row = this.connection
+      .prepare('SELECT status FROM sessions WHERE match_id = ? AND id = ?')
+      .get(matchId, sessionId);
+    if (!row) {
+      return null;
+    }
+    const units = this.connection
+      .prepare('SELECT unit FROM session_units WHERE match_id = ? AND session_id = ? ORDER BY unit')
+      .all(matchId, sessionId)
+      .map((entry) => entry.unit);
+    return { id: sessionId, matchId, status: row.status, units };
+  }
+
+  /** Unit id -> session id claims for a match; a unit belongs to at most one session. */
+  readSessionClaims(matchId) {
+    const claims = new Map();
+    for (const row of this.connection
+      .prepare('SELECT unit, session_id FROM session_units WHERE match_id = ?')
+      .all(matchId)) {
+      claims.set(row.unit, row.session_id);
+    }
+    return claims;
+  }
+
+  setSessionStatus(matchId, sessionId, status) {
+    this.connection.prepare('UPDATE sessions SET status = ? WHERE match_id = ? AND id = ?')
+      .run(status, matchId, sessionId);
   }
 
   getIdempotent(key) {

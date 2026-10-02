@@ -176,7 +176,9 @@ Returns HTTP 201 with the match state plus:
 - **duplicate** — `(tick, unit, command)` is already stored: counted, not applied,
   and it cannot change the state.
 - **rejected** — `reason` is `invalid_input`, `out_of_range` (tick >= `max_ticks`)
-  or `unknown_unit`; records appear in submission order with their `index`.
+  or `unknown_unit`; records appear in submission order with their `index`. The
+  session input route additionally rejects records for foreign units with
+  `wrong_session` (see "Sessions and reconnection").
 - **rollback** — non-null only when a record addressed a tick at or below the
   current frontier.
 
@@ -265,6 +267,68 @@ The response carries `rollback`:
 canonical input, a late input produces the same final `state_hash` as a prompt
 one. Records for ticks past the frontier are stored and applied when the frontier
 reaches them.
+
+### Sessions and reconnection
+
+A client participates in a match through a **session** bound to one or more
+units. Session metadata only gates the input channel: it never enters the
+simulation, the `state_hash` or the replay document, so matches, queries,
+replays, verification and the global input route behave exactly as without
+sessions.
+
+```http
+POST /matches/duel-1/sessions
+Idempotency-Key: session-p1
+
+{"id":"p1","units":["red-1"]}
+```
+
+Returns HTTP 201 with `session_id`, `match_id`, `units` and `status`
+(initially `connected`). `units` must be non-empty, free of duplicates, all
+known in the match configuration, and no unit may belong to another session
+of the same match; `id` follows the same identifier rule as match and unit
+ids. Unknown fields or an illegal body are `validation_error`; a reused
+session id or an already claimed unit is a `conflict`.
+
+A session submits inputs through its own channel:
+
+```http
+POST /matches/duel-1/sessions/p1/inputs
+Idempotency-Key: p1-inputs-1
+
+{"inputs":[{"tick":0,"unit":"red-1","command":{"kind":"move","position":400}}]}
+```
+
+The body, dedup keys, canonical order, late-input rollback, stats and the 201
+response are identical to `POST /matches/{id}/inputs`. A record whose unit is
+not bound to this session is rejected with reason `wrong_session` (counted
+like every other rejection); it is neither stored nor applied. The global
+input route stays open and is not session-scoped.
+
+```http
+POST /matches/duel-1/sessions/p1/disconnect     # -> status "disconnected"
+POST /matches/duel-1/sessions/p1/resume
+Idempotency-Key: p1-resume-1
+
+{"after_tick":4,"limit":1024}
+```
+
+`disconnect` sets `status` to `disconnected`; inputs from a disconnected
+session are a `conflict` and change nothing (repeating the disconnect with the
+same key returns its first response). `resume` sets the session back to
+`connected` and returns the catch-up window: frame summaries strictly after
+`after_tick` (each `{"tick","state_hash","settled","casualties"}`), the
+caught-up `units`, `team_damage`, `state_hash`, plus `next_tick` and
+`complete`. `limit` defaults to and is capped at `1024`; `after_tick` must be
+a non-negative integer. `complete` is `true` exactly when the window reaches
+the current tick (`next_tick` equals the frontier), so a client pages forward
+until it does. Resuming exactly from the frontier returns an empty frame list
+with `complete: true`. `after_tick` past the frontier is a `conflict`; a
+non-contiguous frame log or a snapshot whose hash does not match its recorded
+frame is an `integrity_failure`, and the status is left unchanged. Every
+state-changing session POST requires an `Idempotency-Key`: a repeated key
+returns the stored first response, while the same key with another operation
+or body is a `conflict`. An unknown session returns `not_found`.
 
 ### Replay file format
 
