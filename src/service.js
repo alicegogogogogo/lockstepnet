@@ -509,6 +509,113 @@ class Lockstep {
     });
   }
 
+  /** Load a match's spectator or fail with 404; never returns null. */
+  requireSpectator(matchId, spectatorId) {
+    this.match(matchId);
+    const spectator = this.store.readSpectator(matchId, spectatorId);
+    if (!spectator) {
+      throw new NotFoundError(`spectator ${spectatorId} of match ${matchId} was not found`);
+    }
+    return spectator;
+  }
+
+  /**
+   * The highest tick a spectator may see: while the match runs, the frontier
+   * delayed by `delayTicks`; once the match has ended, the final tick.
+   */
+  spectatorVisibleTick(state, delayTicks) {
+    return state.status === 'running' ? Math.max(0, state.tick - delayTicks) : state.tick;
+  }
+
+  /**
+   * Register a spectator on a match. Spectators are a side channel: they are
+   * stored apart from the simulation and never enter a `state_hash`, a
+   * `replay_hash` or any existing endpoint's response.
+   */
+  createSpectator(matchId, raw, key) {
+    this.match(matchId);
+    sim.exactKeys(raw, ['id', 'delay_ticks'], 'body');
+    if (raw.id === undefined || raw.delay_ticks === undefined) {
+      throw new ValidationError('body must contain id and delay_ticks');
+    }
+    const spectatorId = sim.identifier(raw.id, 'spectator id');
+    const delayTicks = sim.integer(raw.delay_ticks, 'delay_ticks', 0, sim.MAX_STEP);
+    return this.idempotent(key, `create-spectator:${matchId}`, raw, () => {
+      if (this.store.readSpectator(matchId, spectatorId)) {
+        throw new ConflictError(`spectator ${spectatorId} already exists for match ${matchId}`);
+      }
+      const spectator = { delayTicks, highTick: 0, id: spectatorId, needsReset: false };
+      this.store.insertSpectator(matchId, spectator);
+      return {
+        delay_ticks: delayTicks,
+        match_id: matchId,
+        spectator_id: spectatorId,
+        visible_tick: this.spectatorVisibleTick(this.store.readState(matchId), delayTicks),
+      };
+    });
+  }
+
+  /**
+   * Poll the frames a spectator may already see, at most `limit` per call
+   * (default and maximum 1024), together with the unit states and team damage
+   * as they are after the last frame returned.
+   *
+   *  - `stream` mode continues the client's timeline: frames contiguously
+   *    cover the ticks after `after_tick` up to the visible tick, and an
+   *    `after_tick` past it is a `conflict`;
+   *  - `reset` mode applies once a rollback (late input or explicit) rewound
+   *    the match below the highest frame this spectator was already served:
+   *    `after_tick` is ignored and the window restarts from tick 0, paged
+   *    further with the returned `next_tick`.
+   *
+   * Like session catch-up, the window is re-derived from the stored input log
+   * and must reproduce every recorded hash; a divergence is an
+   * `integrity_failure` instead of an inconsistent stream.
+   */
+  pollSpectator(matchId, spectatorId, raw, key) {
+    const spectator = this.requireSpectator(matchId, spectatorId);
+    const body = raw === undefined || raw === null ? {} : raw;
+    sim.exactKeys(body, ['after_tick', 'limit'], 'body');
+    const afterTick = body.after_tick === undefined ? 0 : body.after_tick;
+    if (!Number.isInteger(afterTick) || afterTick < 0) {
+      throw new ValidationError('after_tick must be a non-negative integer');
+    }
+    const limit = body.limit === undefined ? sim.MAX_STEP : body.limit;
+    if (!Number.isInteger(limit) || limit < 1 || limit > sim.MAX_STEP) {
+      throw new ValidationError(`limit must be an integer between 1 and ${sim.MAX_STEP}`);
+    }
+    return this.idempotent(key, `poll-spectator:${matchId}:${spectatorId}`, body, () => {
+      const state = this.store.readState(matchId);
+      const visible = this.spectatorVisibleTick(state, spectator.delayTicks);
+      const reset = spectator.needsReset;
+      let start = afterTick;
+      if (reset) {
+        start = 0;
+      } else if (afterTick > visible) {
+        throw new ConflictError(`after_tick ${afterTick} is past the visible tick ${visible}`);
+      }
+      const frames = this.sessionFrames(matchId, start, limit, visible);
+      const reached = start + frames.length;
+      const response = {
+        complete: reached >= visible,
+        frames,
+        match_id: matchId,
+        mode: reset ? 'reset' : 'stream',
+        next_tick: reached,
+        spectator_id: spectatorId,
+        state_hash: reached >= state.tick ? state.hash : this.frameHashAt(matchId, reached),
+        team_damage: this.teamDamageAt(matchId, reached, state),
+        units: this.unitsAt(matchId, Object.keys(state.units).sort(), reached, state),
+        visible_tick: visible,
+      };
+      // A reset replaces the client's timeline, so the high-water mark follows
+      // the new window; a stream only ever extends it.
+      const highTick = reset ? reached : Math.max(spectator.highTick, reached);
+      this.store.updateSpectator(matchId, spectatorId, highTick, false);
+      return response;
+    });
+  }
+
   /**
    * Advance a match by `count` ticks (default 1).
    *
@@ -558,6 +665,9 @@ class Lockstep {
       throw new ConflictError(`tick ${tick} is past the current tick ${before.tick}`);
     }
     this.resimulate(matchId, tick, tick, false);
+    // Spectators already served a frame past the rewind point restart from
+    // tick 0 on their next poll instead of streaming a diverging timeline.
+    this.store.markSpectatorsReset(matchId, tick);
     const after = this.store.readState(matchId);
     return {
       frames_recomputed: before.tick - tick,

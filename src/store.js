@@ -51,6 +51,12 @@ const SCHEMA = `
     id TEXT NOT NULL, status TEXT NOT NULL, units_json TEXT NOT NULL,
     PRIMARY KEY (match_id, id)
   );
+  CREATE TABLE IF NOT EXISTS spectators (
+    match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    id TEXT NOT NULL, delay_ticks INTEGER NOT NULL,
+    high_tick INTEGER NOT NULL, needs_reset INTEGER NOT NULL,
+    PRIMARY KEY (match_id, id)
+  );
   CREATE TABLE IF NOT EXISTS idempotency (
     key TEXT PRIMARY KEY, operation TEXT NOT NULL,
     request_hash TEXT NOT NULL, response_json TEXT NOT NULL
@@ -245,6 +251,36 @@ class Store {
   setSessionStatus(matchId, sessionId, status) {
     this.connection.prepare('UPDATE sessions SET status = ? WHERE match_id = ? AND id = ?')
       .run(status, matchId, sessionId);
+  }
+
+  insertSpectator(matchId, spectator) {
+    this.connection
+      .prepare('INSERT INTO spectators(match_id, id, delay_ticks, high_tick, needs_reset) VALUES (?, ?, ?, ?, ?)')
+      .run(matchId, spectator.id, spectator.delayTicks, spectator.highTick, spectator.needsReset ? 1 : 0);
+  }
+
+  readSpectator(matchId, spectatorId) {
+    const row = this.connection
+      .prepare('SELECT * FROM spectators WHERE match_id = ? AND id = ?')
+      .get(matchId, spectatorId);
+    return row ? {
+      delayTicks: row.delay_ticks, highTick: row.high_tick,
+      id: row.id, needsReset: row.needs_reset === 1,
+    } : null;
+  }
+
+  /**
+   * Flag every spectator of the match that was already served a frame past
+   * `tick`: its next poll must restart from tick 0 instead of streaming.
+   */
+  markSpectatorsReset(matchId, tick) {
+    this.connection.prepare('UPDATE spectators SET needs_reset = 1 WHERE match_id = ? AND high_tick > ?')
+      .run(matchId, tick);
+  }
+
+  updateSpectator(matchId, spectatorId, highTick, needsReset) {
+    this.connection.prepare('UPDATE spectators SET high_tick = ?, needs_reset = ? WHERE match_id = ? AND id = ?')
+      .run(highTick, needsReset ? 1 : 0, matchId, spectatorId);
   }
 
   getIdempotent(key) {

@@ -345,6 +345,71 @@ new call with the same already-reached state) simply reports that state, so a
 partial catch-up is paged with further `resume` calls. An unknown match is
 `not_found`; an unknown session is also `not_found`.
 
+### Spectators and delay compensation
+
+A spectator is a **side-channel view** of a match: creation and polling are
+recorded apart from the simulation and never change an existing endpoint, a
+`state_hash` or a `replay_hash`.
+
+```http
+POST /matches/duel-1/spectators
+Idempotency-Key: spectator-1
+
+{"id":"cast-1","delay_ticks":4}
+```
+
+Returns HTTP 201 with `spectator_id`, `match_id`, `delay_ticks` and
+`visible_tick`. The body accepts exactly `id` and `delay_ticks`: `id` follows
+the identifier rule and must be unique within the match (a duplicate is a
+`conflict`), and `delay_ticks` is an integer from `0` to `1024`. The visible
+frontier is `max(0, tick - delay_ticks)` while the match is `running` and the
+final tick once the match has ended, so a spectator always trails the live
+frontier by its delay.
+
+```http
+POST /matches/duel-1/spectators/cast-1/poll
+Idempotency-Key: poll-1
+
+{"after_tick":0,"limit":1024}
+```
+
+`after_tick` is the last frame the client holds (default `0`) and `limit` caps
+the frames per call (default and maximum `1024`, minimum `1`). The response
+carries:
+
+```json
+{
+  "spectator_id": "cast-1",
+  "match_id": "duel-1",
+  "mode": "stream",
+  "visible_tick": 4,
+  "frames": [{"tick":1,"state_hash":"<64 hex>","settled":true,"casualties":[]}],
+  "next_tick": 4,
+  "units": [
+    {"id":"red-1","team":"red","position":400,"velocity":5,"health":90,"attacking":true,"alive":true}
+  ],
+  "team_damage": {"blue": 0, "red": 10},
+  "state_hash": "<64 hex>",
+  "complete": true
+}
+```
+
+- `mode` is `stream` when the window continues the client's timeline: `frames`
+  contiguously cover the ticks after `after_tick` up to `visible_tick`, each
+  re-derived from the stored input log and checked against its recorded hash (a
+  divergence is an `integrity_failure`). `units`, `team_damage` and
+  `state_hash` are projected at `next_tick` — when `frames` is empty, at
+  `after_tick`. `complete` is `true` only once the frames reach
+  `visible_tick`; otherwise the client pages with `after_tick` set to the
+  returned `next_tick`. An `after_tick` past `visible_tick` is a `conflict`.
+- `mode` is `reset` when a late input or `POST /rollback` rewound the match to
+  a tick below the highest frame already returned to this spectator: the poll
+  ignores `after_tick` and resends from tick 0 (at most `limit` frames), and
+  the client pages further with `next_tick`.
+
+An unknown match or spectator is `not_found`; a malformed `id`, `delay_ticks`,
+`after_tick` or `limit` is a `validation_error`.
+
 ### Replay file format
 
 ```json
