@@ -46,6 +46,11 @@ const SCHEMA = `
     name TEXT NOT NULL, value INTEGER NOT NULL,
     PRIMARY KEY (match_id, name)
   );
+  CREATE TABLE IF NOT EXISTS sessions (
+    match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    id TEXT NOT NULL, status TEXT NOT NULL, units_json TEXT NOT NULL,
+    PRIMARY KEY (match_id, id)
+  );
   CREATE TABLE IF NOT EXISTS idempotency (
     key TEXT PRIMARY KEY, operation TEXT NOT NULL,
     request_hash TEXT NOT NULL, response_json TEXT NOT NULL
@@ -215,6 +220,31 @@ class Store {
     this.connection
       .prepare('INSERT INTO stats(match_id, name, value) VALUES (?, ?, ?) ON CONFLICT(match_id, name) DO UPDATE SET value = value + excluded.value')
       .run(matchId, name, amount);
+  }
+
+  insertSession(matchId, session) {
+    this.connection
+      .prepare('INSERT INTO sessions(match_id, id, status, units_json) VALUES (?, ?, ?, ?)')
+      .run(matchId, session.id, session.status, JSON.stringify(session.units));
+  }
+
+  readSession(matchId, sessionId) {
+    const row = this.connection
+      .prepare('SELECT * FROM sessions WHERE match_id = ? AND id = ?')
+      .get(matchId, sessionId);
+    return row ? { id: row.id, status: row.status, units: JSON.parse(row.units_json) } : null;
+  }
+
+  readSessions(matchId) {
+    return this.connection
+      .prepare('SELECT * FROM sessions WHERE match_id = ? ORDER BY id')
+      .all(matchId)
+      .map((row) => ({ id: row.id, status: row.status, units: JSON.parse(row.units_json) }));
+  }
+
+  setSessionStatus(matchId, sessionId, status) {
+    this.connection.prepare('UPDATE sessions SET status = ? WHERE match_id = ? AND id = ?')
+      .run(status, matchId, sessionId);
   }
 
   getIdempotent(key) {

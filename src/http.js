@@ -54,6 +54,14 @@ function send(response, status, payload) {
   response.end(body);
 }
 
+/** Read an optional JSON body: a request with no Content-Type carries no body. */
+function readOptionalBody(request) {
+  if (request.headers['content-type'] === undefined) {
+    return Promise.resolve(null);
+  }
+  return readBody(request);
+}
+
 function createHandler(service) {
   return async function handle(request, response) {
     try {
@@ -103,6 +111,26 @@ function createHandler(service) {
         if (method === 'POST' && parts.length === 3 && parts[2] === 'verify') {
           send(response, 200, service.verify(await readBody(request)));
           return;
+        }
+        if (method === 'POST' && parts.length === 3 && parts[2] === 'sessions') {
+          send(response, 201, service.createSession(id, await readBody(request), key));
+          return;
+        }
+        if (parts.length === 5 && parts[2] === 'sessions') {
+          const sessionId = decodeURIComponent(parts[3]);
+          const action = parts[4];
+          if (method === 'POST' && action === 'inputs') {
+            send(response, 201, service.submitSessionInputs(id, sessionId, await readBody(request), key));
+            return;
+          }
+          if (method === 'POST' && action === 'disconnect') {
+            send(response, 200, service.disconnectSession(id, sessionId, await readOptionalBody(request), key));
+            return;
+          }
+          if (method === 'POST' && action === 'resume') {
+            send(response, 200, service.resumeSession(id, sessionId, await readBody(request), key));
+            return;
+          }
         }
       }
       throw new NotFoundError('route was not found');

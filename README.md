@@ -266,6 +266,85 @@ canonical input, a late input produces the same final `state_hash` as a prompt
 one. Records for ticks past the frontier are stored and applied when the frontier
 reaches them.
 
+### Sessions, disconnect and resume
+
+A session binds a client to one or more match units so its inputs are submitted
+through a session channel. Sessions are bookkeeping only: they never take part
+in a `state_hash` or `replay_hash`, and queries, replay, verification,
+advancement and rollback behave exactly as without them.
+
+```http
+POST /matches/duel-1/sessions
+Idempotency-Key: session-p1
+
+{"id":"p1","units":["red-1"]}
+```
+
+Returns HTTP 201 with `session_id`, `match_id`, `units` and a `status` that
+starts at `connected`. `units` must be a non-empty list of distinct units that
+all belong to the match, and no unit may belong to two sessions; creating a
+session whose id already exists is a `conflict`.
+
+```http
+POST /matches/duel-1/sessions/p1/inputs
+Idempotency-Key: session-p1-inputs-1
+
+{"inputs":[{"tick":0,"unit":"red-1","command":{"kind":"attack","attacking":true}}]}
+```
+
+This uses the same input format, de-duplication key, canonical order, late-input
+rollback and counters as `POST /matches/{id}/inputs`. A record whose unit is not
+bound to the session is reported under `rejected` with reason
+`wrong_session`; submitting to a `disconnected` session is a `conflict`.
+
+```http
+POST /matches/duel-1/sessions/p1/disconnect   # body must be {} or empty
+Idempotency-Key: session-p1-disconnect
+
+POST /matches/duel-1/sessions/p1/resume
+Idempotency-Key: session-p1-resume-1
+
+{"after_tick":4,"limit":1024}
+```
+
+`disconnect` sets the session `status` to `disconnected` without touching the
+match. `resume` sets it back to `connected` and streams the frames recorded
+**after** `after_tick`, at most `limit` of them (`limit` defaults to `1024` and
+may not exceed it). The response carries:
+
+```json
+{
+  "session_id": "p1",
+  "match_id": "duel-1",
+  "status": "connected",
+  "frames": [
+    {"tick": 5, "state_hash": "<64 hex>", "settled": true, "casualties": []}
+  ],
+  "units": [
+    {"id":"red-1","team":"red","position":0,"velocity":5,"health":90,"attacking":true,"alive":true}
+  ],
+  "team_damage": {"blue": 0, "red": 10},
+  "state_hash": "<64 hex>",
+  "next_tick": 8,
+  "complete": true
+}
+```
+
+- `frames` are contiguous and in tick order; each is re-derived from the stored
+  input log and must reproduce its recorded hash, otherwise the request fails
+  with `integrity_failure` instead of returning inconsistent data.
+- `units` lists the session's units and `team_damage` the totals as they are at
+  `next_tick`; `state_hash` is the hash of that tick.
+- `complete` is `true` once the window reaches the current frontier, otherwise
+  the client calls again with `after_tick` set to the returned `next_tick`.
+
+`after_tick` must be a non-negative integer no greater than the current tick
+(`conflict` when it is ahead); `limit` must be an integer from `1` to `1024`.
+`disconnect` and `resume` are state-transition calls: repeating either one (a
+new call with the same already-reached state) simply reports that state, so a
+partial catch-up is paged with further `resume` calls. An unknown match is
+`not_found`; an unknown session is also `not_found`.
+
 ### Replay file format
 
 ```json

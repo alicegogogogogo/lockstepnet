@@ -380,5 +380,6 @@ module.exports = {
   ATTACK_BASE, COMMAND_ORDER, HEALTH_MAX, MAX_STEP, MAX_TICKS_LIMIT, MAX_UNITS,
   POSITION_MAX, POSITION_MIN, SCHEMA_VERSION, TEAMS,
   applyTick, canonicalInput, cloneState, compareInputs, exactKeys, fileHash,
-  initialState, inputSetHash, liveUnits, parseConfig, parseInputRecord, stateHash, stripInput,
+  identifier, initialState, inputSetHash, integer, liveUnits, parseConfig,
+  parseInputRecord, stateHash, stripInput,
 };

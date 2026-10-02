@@ -156,61 +156,355 @@ class Lockstep {
       if (raw.inputs.length === 0) {
         throw new ValidationError('inputs must be a non-empty array');
       }
+      return this.processInputs(record, raw.inputs);
+    });
+  }
+
+  /**
+   * The input pipeline shared by the match-wide and the session-scoped input
+   * endpoints: validation, de-duplication, stat accounting and the single
+   * rollback-and-rebuild pass for late records. When `options.session` is set, a
+   * record whose unit is not bound to that session is rejected with
+   * `wrong_session` instead of being applied; the global rules, ordering and
+   * counters stay identical.
+   */
+  processInputs(record, entries, options = {}) {
+    const matchId = record.config.id;
+    const session = options.session || null;
+    const frontier = this.store.readState(matchId).tick;
+    const accepted = [];
+    const duplicates = [];
+    const rejected = [];
+    let earliest = null;
+    entries.forEach((entry, index) => {
+      let input;
+      try {
+        input = sim.parseInputRecord(entry);
+      } catch (error) {
+        rejected.push({ index, message: error.message, reason: 'invalid_input' });
+        return;
+      }
+      if (input.tick >= record.config.maxTicks) {
+        rejected.push({
+          index,
+          message: `input tick ${input.tick} is outside the match length ${record.config.maxTicks}`,
+          reason: 'out_of_range',
+        });
+        return;
+      }
+      if (!record.config.units.some((unit) => unit.id === input.unit)) {
+        rejected.push({ index, message: `input references unknown unit ${input.unit}`, reason: 'unknown_unit' });
+        return;
+      }
+      if (session && !session.units.includes(input.unit)) {
+        rejected.push({
+          index,
+          message: `unit ${input.unit} does not belong to session ${session.id}`,
+          reason: 'wrong_session',
+        });
+        return;
+      }
+      if (this.store.readInput(matchId, input.tick, input.unit, input.command.kind)) {
+        duplicates.push({ command: input.command.kind, tick: input.tick, unit: input.unit });
+        return;
+      }
+      input.arrival = this.store.countInputsBefore(matchId, record.config.maxTicks);
+      this.store.insertInput(matchId, input, sim.stripInput(input));
+      accepted.push({ command: input.command.kind, seq: input.seq, tick: input.tick, unit: input.unit });
+      if (earliest === null || input.tick < earliest) {
+        earliest = input.tick;
+      }
+    });
+
+    this.store.bumpStat(matchId, 'accepted', accepted.length);
+    this.store.bumpStat(matchId, 'duplicates', duplicates.length);
+    this.store.bumpStat(matchId, 'rejected', rejected.length);
+
+    let rollback = null;
+    if (earliest !== null && earliest < frontier) {
+      // A late input rewinds the match to the earliest affected tick and then
+      // replays forward to the frontier it had reached before this request, so
+      // accepting a late input never loses already simulated ticks.
+      const rewound = this.rollback(matchId, earliest);
+      const { frames } = this.resimulate(matchId, earliest, frontier, false);
+      const after = this.store.readState(matchId);
+      this.store.bumpStat(matchId, 'rollbacks', 1);
+      rollback = { ...rewound, frames_recomputed: frames.length, hash_after: after.hash, tick: after.tick };
+    }
+    return {
+      ...this.describe(record.config, this.store.readState(matchId)),
+      accepted, duplicates, rejected, rollback,
+    };
+  }
+
+  /** Load a match's session or fail with 404; never returns null. */
+  requireSession(matchId, sessionId) {
+    this.match(matchId);
+    const session = this.store.readSession(matchId, sessionId);
+    if (!session) {
+      throw new NotFoundError(`session ${sessionId} of match ${matchId} was not found`);
+    }
+    return session;
+  }
+
+  describeSession(matchId, session) {
+    return {
+      match_id: matchId,
+      session_id: session.id,
+      status: session.status,
+      units: session.units.slice(),
+    };
+  }
+
+  /**
+   * Bind a session to one or more match units. Units must be a non-empty list of
+   * distinct units of this match, and no unit may belong to another session, so
+   * ownership is unique. Sessions are bookkeeping only: they never enter the
+   * state hash or the replay document.
+   */
+  createSession(matchId, raw, key) {
+    const record = this.match(matchId);
+    sim.exactKeys(raw, ['id', 'units'], 'body');
+    if (raw.id === undefined || raw.units === undefined) {
+      throw new ValidationError('body must contain id and units');
+    }
+    const sessionId = sim.identifier(raw.id, 'session id');
+    if (!Array.isArray(raw.units) || raw.units.length === 0) {
+      throw new ValidationError('units must be a non-empty array');
+    }
+    const units = [];
+    const seen = new Set();
+    for (const entry of raw.units) {
+      const unitId = sim.identifier(entry, 'session unit id');
+      if (seen.has(unitId)) {
+        throw new ValidationError(`session units must be unique: ${unitId}`);
+      }
+      seen.add(unitId);
+      if (!record.config.units.some((unit) => unit.id === unitId)) {
+        throw new ValidationError(`session references unknown unit ${unitId}`);
+      }
+      units.push(unitId);
+    }
+    units.sort();
+    return this.idempotent(key, `create-session:${matchId}`, raw, () => {
+      if (this.store.readSession(matchId, sessionId)) {
+        throw new ConflictError(`session ${sessionId} already exists for match ${matchId}`);
+      }
+      for (const other of this.store.readSessions(matchId)) {
+        const overlap = other.units.find((unitId) => seen.has(unitId));
+        if (overlap) {
+          throw new ConflictError(`unit ${overlap} already belongs to session ${other.id}`);
+        }
+      }
+      const session = { id: sessionId, status: 'connected', units };
+      this.store.insertSession(matchId, session);
+      return this.describeSession(matchId, session);
+    });
+  }
+
+  /**
+   * Submit inputs through a session. The format, de-duplication key, canonical
+   * order, late-input rollback and counters are exactly those of the match-wide
+   * endpoint; an input for a unit the session does not own is rejected with
+   * reason `wrong_session`, and a disconnected session may not submit at all.
+   */
+  submitSessionInputs(matchId, sessionId, raw, key) {
+    const session = this.requireSession(matchId, sessionId);
+    sim.exactKeys(raw, ['inputs'], 'body');
+    if (!Array.isArray(raw.inputs)) {
+      throw new ValidationError('inputs must be an array');
+    }
+    return this.idempotent(key, `submit-session-inputs:${matchId}:${sessionId}`, raw, () => {
+      if (session.status === 'disconnected') {
+        throw new ConflictError(`session ${sessionId} is disconnected and cannot submit inputs`);
+      }
+      if (raw.inputs.length === 0) {
+        throw new ValidationError('inputs must be a non-empty array');
+      }
+      return this.processInputs(this.match(matchId), raw.inputs, { session });
+    });
+  }
+
+  /** Mark a session disconnected; the match itself is unaffected. Idempotent. */
+  disconnectSession(matchId, sessionId, raw, key) {
+    const session = this.requireSession(matchId, sessionId);
+    const body = raw === undefined || raw === null ? {} : raw;
+    sim.exactKeys(body, [], 'body');
+    return this.idempotent(key, `disconnect-session:${matchId}:${sessionId}`, body, () => {
+      if (session.status !== 'disconnected') {
+        this.store.setSessionStatus(matchId, sessionId, 'disconnected');
+      }
+      return this.describeSession(matchId, { ...session, status: 'disconnected' });
+    });
+  }
+
+  /**
+   * Reconnect a session and stream the frames recorded *after* `after_tick`, at
+   * most `limit` per call (default and maximum 1024), together with the
+   * caught-up unit states and team damage. The session ends up `connected`; a
+   * partial window reports `complete: false` and is paged by calling again with
+   * the returned `next_tick`.
+   *
+   * The window is read from the recorded frame log and must be contiguous and
+   * hash-consistent end to end; a gap or a recomputation mismatch is an
+   * `integrity_failure` instead of an inconsistent catch-up.
+   */
+  resumeSession(matchId, sessionId, raw, key) {
+    const session = this.requireSession(matchId, sessionId);
+    sim.exactKeys(raw, ['after_tick', 'limit'], 'body');
+    if (!Object.prototype.hasOwnProperty.call(raw, 'after_tick')) {
+      throw new ValidationError('body must contain after_tick');
+    }
+    const afterTick = raw.after_tick;
+    if (!Number.isInteger(afterTick) || afterTick < 0) {
+      throw new ValidationError('after_tick must be a non-negative integer');
+    }
+    const limit = raw.limit === undefined ? sim.MAX_STEP : raw.limit;
+    if (!Number.isInteger(limit) || limit < 1 || limit > sim.MAX_STEP) {
+      throw new ValidationError(`limit must be an integer between 1 and ${sim.MAX_STEP}`);
+    }
+    return this.idempotent(key, `resume-session:${matchId}:${sessionId}`, raw, () => {
       const frontier = this.store.readState(matchId).tick;
-      const accepted = [];
-      const duplicates = [];
-      const rejected = [];
-      let earliest = null;
-      raw.inputs.forEach((entry, index) => {
-        let input;
-        try {
-          input = sim.parseInputRecord(entry);
-        } catch (error) {
-          rejected.push({ index, message: error.message, reason: 'invalid_input' });
-          return;
-        }
-        if (input.tick >= record.config.maxTicks) {
-          rejected.push({
-            index,
-            message: `input tick ${input.tick} is outside the match length ${record.config.maxTicks}`,
-            reason: 'out_of_range',
-          });
-          return;
-        }
-        if (!record.config.units.some((unit) => unit.id === input.unit)) {
-          rejected.push({ index, message: `input references unknown unit ${input.unit}`, reason: 'unknown_unit' });
-          return;
-        }
-        if (this.store.readInput(matchId, input.tick, input.unit, input.command.kind)) {
-          duplicates.push({ command: input.command.kind, tick: input.tick, unit: input.unit });
-          return;
-        }
-        input.arrival = this.store.countInputsBefore(matchId, record.config.maxTicks);
-        this.store.insertInput(matchId, input, sim.stripInput(input));
-        accepted.push({ command: input.command.kind, seq: input.seq, tick: input.tick, unit: input.unit });
-        if (earliest === null || input.tick < earliest) {
-          earliest = input.tick;
-        }
+      if (afterTick > frontier) {
+        throw new ConflictError(`after_tick ${afterTick} is past the current tick ${frontier}`);
+      }
+      const frames = this.sessionFrames(matchId, afterTick, limit, frontier);
+      if (session.status !== 'connected') {
+        this.store.setSessionStatus(matchId, sessionId, 'connected');
+      }
+      const state = this.store.readState(matchId);
+      const reached = afterTick + frames.length;
+      const complete = reached >= frontier;
+      const units = this.unitsAt(matchId, session.units, reached, state)
+        .sort((left, right) => (left.id < right.id ? -1 : 1));
+      return {
+        complete,
+        frames,
+        match_id: matchId,
+        next_tick: reached,
+        session_id: sessionId,
+        state_hash: complete ? state.hash : this.frameHashAt(matchId, reached),
+        status: 'connected',
+        team_damage: this.teamDamageAt(matchId, reached, state),
+        units,
+      };
+    });
+  }
+
+  /**
+   * The recorded frame summaries strictly after `afterTick`, up to `limit`, in
+   * tick order. The log must be contiguous from the requested point; the window
+   * is re-derived in memory from the snapshot before it and must reproduce every
+   * recorded hash - a divergence is an integrity failure rather than a silently
+   * different catch-up. Nothing here mutates the frame log.
+   */
+  sessionFrames(matchId, afterTick, limit, frontier) {
+    const end = Math.min(afterTick + limit, frontier);
+    const byTick = new Map();
+    for (const frame of this.store.readFramesFrom(matchId, afterTick + 1)) {
+      byTick.set(frame.tick, frame);
+    }
+    const frames = [];
+    for (let tick = afterTick + 1; tick <= end; tick += 1) {
+      const frame = byTick.get(tick);
+      if (!frame) {
+        // Every tick up to the frontier must have a frame; a gap means the log
+        // was corrupted and catch-up cannot be served continuously.
+        throw new IntegrityError(`match ${matchId} is missing recorded frame ${tick}`);
+      }
+      frames.push({
+        casualties: frame.delta.casualties, settled: frame.settled,
+        state_hash: frame.state_hash, tick: frame.tick,
       });
+    }
+    if (frames.length > 0) {
+      this.verifyWindow(matchId, afterTick, frames);
+    }
+    return frames;
+  }
 
-      this.store.bumpStat(matchId, 'accepted', accepted.length);
-      this.store.bumpStat(matchId, 'duplicates', duplicates.length);
-      this.store.bumpStat(matchId, 'rejected', rejected.length);
+  /**
+   * Recompute the frames of a catch-up window in memory from the snapshot before
+   * it and the stored input log, comparing each hash with the recorded one. This
+   * is the read-only counterpart of the rollback rebuild: session catch-up never
+   * trims or rewrites the frame log.
+   */
+  verifyWindow(matchId, afterTick, frames) {
+    const state = this.snapshotAt(matchId, afterTick);
+    const buckets = new Map();
+    for (const input of this.store.readInputs(matchId)) {
+      const bucket = buckets.get(input.tick);
+      if (bucket) {
+        bucket.push(input.body);
+      } else {
+        buckets.set(input.tick, [input.body]);
+      }
+    }
+    for (const bucket of buckets.values()) {
+      bucket.sort(sim.compareInputs);
+    }
+    for (const frame of frames) {
+      const settled = buckets.get(state.tick) || [];
+      sim.applyTick(state, settled);
+      state.hash = sim.stateHash(state);
+      if (state.tick !== frame.tick || state.hash !== frame.state_hash) {
+        throw new IntegrityError(`frame ${frame.tick} of match ${matchId} does not recompute to its recorded hash`);
+      }
+    }
+  }
 
-      let rollback = null;
-      if (earliest !== null && earliest < frontier) {
-        // A late input rewinds the match to the earliest affected tick and then
-        // replays forward to the frontier it had reached before this request, so
-        // accepting a late input never loses already simulated ticks.
-        const rewound = this.rollback(matchId, earliest);
-        const { frames } = this.resimulate(matchId, earliest, frontier, false);
-        const after = this.store.readState(matchId);
-        this.store.bumpStat(matchId, 'rollbacks', 1);
-        rollback = { ...rewound, frames_recomputed: frames.length, hash_after: after.hash, tick: after.tick };
+  /** Hash of the state *after* frame `tick`; 0 is the initial (frontier) hash. */
+  frameHashAt(matchId, tick) {
+    if (tick <= 0) {
+      return sim.stateHash(sim.initialState(this.config(matchId)));
+    }
+    const frame = this.store.readFrames(matchId).find((candidate) => candidate.tick === tick);
+    if (!frame) {
+      throw new IntegrityError(`match ${matchId} has no recorded frame ${tick}`);
+    }
+    return frame.state_hash;
+  }
+
+  /** Team damage at frame `tick`, taken from the frame snapshot when mid-window. */
+  teamDamageAt(matchId, tick, current) {
+    if (tick >= current.tick) {
+      return { blue: current.teamDamage.blue, red: current.teamDamage.red };
+    }
+    if (tick <= 0) {
+      return { blue: 0, red: 0 };
+    }
+    const frame = this.store.readFrames(matchId).find((candidate) => candidate.tick === tick);
+    if (!frame) {
+      throw new IntegrityError(`match ${matchId} has no recorded frame ${tick}`);
+    }
+    return { blue: frame.state.teams.blue, red: frame.state.teams.red };
+  }
+
+  /** Snapshots of the session-owned units as they are at frame `tick`. */
+  unitsAt(matchId, unitIds, tick, current) {
+    let source;
+    if (tick >= current.tick) {
+      source = current.units;
+    } else if (tick <= 0) {
+      source = sim.initialState(this.config(matchId)).units;
+    } else {
+      const frame = this.store.readFrames(matchId).find((candidate) => candidate.tick === tick);
+      if (!frame) {
+        throw new IntegrityError(`match ${matchId} has no recorded frame ${tick}`);
+      }
+      source = {};
+      for (const unit of frame.state.units) {
+        source[unit.id] = unit;
+      }
+    }
+    return unitIds.map((id) => {
+      const unit = source[id];
+      if (!unit) {
+        throw new IntegrityError(`frame ${tick} of match ${matchId} is missing unit ${id}`);
       }
       return {
-        ...this.describe(record.config, this.store.readState(matchId)),
-        accepted, duplicates, rejected, rollback,
+        alive: unit.health > 0, attacking: unit.attacking, health: unit.health,
+        id: unit.id, position: unit.position, team: unit.team, velocity: unit.velocity,
       };
     });
   }
