@@ -70,10 +70,23 @@ function readOptionalBody(request) {
   return readBody(request);
 }
 
+/** Query string as a plain object of strings; a repeated field is a 400. */
+function queryFields(url) {
+  const fields = {};
+  for (const [name, value] of url.searchParams) {
+    if (Object.prototype.hasOwnProperty.call(fields, name)) {
+      throw new ValidationError(`query has duplicate field ${name}`);
+    }
+    fields[name] = value;
+  }
+  return fields;
+}
+
 function createHandler(service) {
   return async function handle(request, response) {
     try {
-      const parts = new URL(request.url, 'http://localhost').pathname.split('/').filter((part) => part.length > 0);
+      const url = new URL(request.url, 'http://localhost');
+      const parts = url.pathname.split('/').filter((part) => part.length > 0);
       const { method } = request;
       const key = request.headers['idempotency-key'];
 
@@ -89,6 +102,14 @@ function createHandler(service) {
         const id = decodeURIComponent(parts[1]);
         if (method === 'GET' && parts.length === 2) {
           send(response, 200, service.getState(id));
+          return;
+        }
+        if (method === 'GET' && parts.length === 3 && parts[2] === 'snapshot') {
+          send(response, 200, service.getSnapshot(id, queryFields(url)));
+          return;
+        }
+        if (method === 'GET' && parts.length === 3 && parts[2] === 'deltas') {
+          send(response, 200, service.getDeltas(id, queryFields(url)));
           return;
         }
         if (method === 'GET' && parts.length === 3 && parts[2] === 'replay') {

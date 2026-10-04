@@ -22,6 +22,41 @@ function requestHash(body) {
   return createHash('sha256').update(canonicalJson(body)).digest('hex');
 }
 
+/** Parse a query-string integer: the value must be a base-10 integer literal. */
+function queryInteger(value, field) {
+  if (typeof value !== 'string' || !/^-?\d+$/.test(value)) {
+    throw new ValidationError(`${field} must be an integer`);
+  }
+  return Number(value);
+}
+
+/** Public projection of one unit, as exposed by state, snapshot and delta reads. */
+function projectUnit(unit) {
+  return {
+    alive: unit.health > 0, attacking: unit.attacking, health: unit.health,
+    id: unit.id, position: unit.position, team: unit.team, velocity: unit.velocity,
+  };
+}
+
+/**
+ * Units whose public projection differs between two consecutive states, sorted
+ * by unit id, each as its full projection in the later state. An `attacking`
+ * toggle and a death are changes exactly like position, health or velocity.
+ */
+function changedUnits(previous, state) {
+  const changed = [];
+  for (const id of Object.keys(state.units).sort()) {
+    const before = previous.units[id];
+    const unit = state.units[id];
+    if (unit.attacking !== before.attacking || unit.health !== before.health
+      || unit.position !== before.position || unit.team !== before.team
+      || unit.velocity !== before.velocity) {
+      changed.push(projectUnit(unit));
+    }
+  }
+  return changed;
+}
+
 /** A spectator stream may trail the live frontier by at most this many ticks. */
 const MAX_SPECTATOR_DELAY = 1024;
 
@@ -96,6 +131,124 @@ class Lockstep {
   getState(matchId) {
     const record = this.match(matchId);
     return this.describe(record.config, this.store.readState(matchId));
+  }
+
+  /**
+   * `GET /matches/{id}/snapshot?tick=N`: the deterministic state after frame
+   * `tick` (the initial state for tick 0). The timeline up to `tick` is rebuilt
+   * from the initial conditions and the stored input log, and every recorded
+   * frame hash on the way must reproduce; a gap or divergence is an
+   * `integrity_failure`. Purely read-only: no idempotency key, no advancement,
+   * no statistics.
+   */
+  getSnapshot(matchId, query) {
+    this.match(matchId);
+    sim.exactKeys(query, ['tick'], 'query');
+    if (!Object.prototype.hasOwnProperty.call(query, 'tick')) {
+      throw new ValidationError('query must contain tick');
+    }
+    const tick = queryInteger(query.tick, 'tick');
+    if (tick < 0) {
+      throw new ValidationError('tick must be a non-negative integer');
+    }
+    const current = this.store.readState(matchId);
+    if (tick > current.tick) {
+      throw new ConflictError(`tick ${tick} is past the current tick ${current.tick}`);
+    }
+    const [state] = this.rebuildWindow(matchId, tick, tick);
+    return {
+      match_id: matchId,
+      tick,
+      status: this.statusAt(tick, current),
+      state_hash: state.hash,
+      team_damage: { blue: state.teamDamage.blue, red: state.teamDamage.red },
+      units: Object.values(state.units)
+        .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
+        .map(projectUnit),
+    };
+  }
+
+  /**
+   * `GET /matches/{id}/deltas?after_tick=N&limit=L`: the contiguous recorded
+   * frames strictly after `after_tick` (the frame the caller already holds), at
+   * most `limit` of them. Each delta carries the units whose public projection
+   * changed against the previous frame, as their full new projection, so
+   * applying the page to the snapshot at `after_tick` reproduces the snapshot
+   * at `next_tick` - which is verified here before anything is returned. The
+   * whole window is rebuilt deterministically and checked against the recorded
+   * hashes; a gap, a divergence or a page that does not rebuild its target
+   * snapshot is an `integrity_failure`. Purely read-only.
+   */
+  getDeltas(matchId, query) {
+    this.match(matchId);
+    sim.exactKeys(query, ['after_tick', 'limit'], 'query');
+    if (!Object.prototype.hasOwnProperty.call(query, 'after_tick')) {
+      throw new ValidationError('query must contain after_tick');
+    }
+    const afterTick = queryInteger(query.after_tick, 'after_tick');
+    if (afterTick < 0) {
+      throw new ValidationError('after_tick must be a non-negative integer');
+    }
+    const limit = query.limit === undefined ? sim.MAX_STEP : queryInteger(query.limit, 'limit');
+    if (!Number.isInteger(limit) || limit < 1 || limit > sim.MAX_STEP) {
+      throw new ValidationError(`limit must be an integer between 1 and ${sim.MAX_STEP}`);
+    }
+    const current = this.store.readState(matchId);
+    const frontier = current.tick;
+    if (afterTick > frontier) {
+      throw new ConflictError(`after_tick ${afterTick} is past the current tick ${frontier}`);
+    }
+    const end = Math.min(afterTick + limit, frontier);
+    const states = this.rebuildWindow(matchId, afterTick, end);
+    const recorded = new Map();
+    for (const frame of this.store.readFramesFrom(matchId, afterTick + 1)) {
+      recorded.set(frame.tick, frame);
+    }
+    const deltas = [];
+    for (let index = 1; index < states.length; index += 1) {
+      const previous = states[index - 1];
+      const state = states[index];
+      const frame = recorded.get(state.tick);
+      deltas.push({
+        tick: state.tick,
+        state_hash: state.hash,
+        status: this.statusAt(state.tick, current),
+        settled: frame.settled,
+        casualties: Object.keys(state.units)
+          .filter((id) => previous.units[id].health > 0 && state.units[id].health <= 0)
+          .sort(),
+        team_damage: { blue: state.teamDamage.blue, red: state.teamDamage.red },
+        changed: changedUnits(previous, state),
+      });
+    }
+    // The page must rebuild the snapshot at its end from the snapshot at
+    // `after_tick`; anything less would send the caller an inconsistent diff.
+    const applied = sim.cloneState(states[0]);
+    for (const delta of deltas) {
+      for (const unit of delta.changed) {
+        applied.units[unit.id] = {
+          attacking: unit.attacking, health: unit.health, id: unit.id,
+          position: unit.position, team: unit.team, velocity: unit.velocity,
+        };
+      }
+      applied.teamDamage = { blue: delta.team_damage.blue, red: delta.team_damage.red };
+      applied.tick = delta.tick;
+    }
+    applied.hash = sim.stateHash(applied);
+    if (applied.hash !== states[states.length - 1].hash) {
+      throw new IntegrityError(
+        `deltas after tick ${afterTick} of match ${matchId} do not rebuild the snapshot at tick ${end}`,
+      );
+    }
+    const nextTick = afterTick + deltas.length;
+    return {
+      match_id: matchId,
+      after_tick: afterTick,
+      base_state_hash: states[0].hash,
+      next_tick: nextTick,
+      complete: nextTick >= frontier,
+      deltas,
+    };
   }
 
   /**
@@ -957,6 +1110,65 @@ class Lockstep {
       state.units[unit.id] = { ...unit };
     }
     return state;
+  }
+
+  /**
+   * The status the match had right after frame `tick`: the recorded status at
+   * the frontier, and `running` before it, because frames are only recorded
+   * while the simulation runs.
+   */
+  statusAt(tick, current) {
+    return tick >= current.tick ? current.status : 'running';
+  }
+
+  /**
+   * Deterministically rebuild the timeline from the initial state through
+   * `toTick`, requiring a contiguous recorded frame at every tick and checking
+   * each rebuilt hash against the recorded one. Returns the states after frames
+   * `fromTick..toTick` (index 0 is the state after frame `fromTick`). A frame
+   * gap or a hash divergence is an `integrity_failure`: a history read never
+   * serves a timeline that does not reproduce its recorded hashes.
+   */
+  rebuildWindow(matchId, fromTick, toTick) {
+    const config = this.config(matchId);
+    const recorded = new Map();
+    for (const frame of this.store.readFrames(matchId)) {
+      recorded.set(frame.tick, frame);
+    }
+    const buckets = new Map();
+    for (const input of this.store.readInputs(matchId)) {
+      const bucket = buckets.get(input.tick);
+      if (bucket) {
+        bucket.push(input.body);
+      } else {
+        buckets.set(input.tick, [input.body]);
+      }
+    }
+    for (const bucket of buckets.values()) {
+      bucket.sort(sim.compareInputs);
+    }
+    const state = sim.initialState(config);
+    state.hash = sim.stateHash(state);
+    const states = [];
+    if (fromTick === 0) {
+      states.push(sim.cloneState(state));
+    }
+    for (let tick = 1; tick <= toTick; tick += 1) {
+      const frame = recorded.get(tick);
+      if (!frame) {
+        throw new IntegrityError(`match ${matchId} is missing recorded frame ${tick}`);
+      }
+      const settled = buckets.get(state.tick) || [];
+      sim.applyTick(state, settled);
+      state.hash = sim.stateHash(state);
+      if (state.hash !== frame.state_hash) {
+        throw new IntegrityError(`frame ${tick} of match ${matchId} does not recompute to its recorded hash`);
+      }
+      if (tick >= fromTick) {
+        states.push(sim.cloneState(state));
+      }
+    }
+    return states;
   }
 }
 

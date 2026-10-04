@@ -231,6 +231,66 @@ canonical inputs of its tick), `frame_sequence` (the log skips or repeats a tick
 or `replay_hash` (the document fingerprint is wrong), plus the offending `tick`.
 Shuffling the `inputs` array of a valid document does not change the verdict.
 
+### Snapshots and deltas
+
+```http
+GET /matches/duel-1/snapshot?tick=4
+GET /matches/duel-1/deltas?after_tick=4&limit=1024
+```
+
+Two read-only history endpoints. Neither requires an `Idempotency-Key`, and
+neither advances the match, rewrites the frame log or changes any counter;
+after a late input or an explicit rollback they expose only the current
+recomputed timeline.
+
+`GET /matches/{id}/snapshot` returns the deterministic state after frame
+`tick` (`0` is the initial state, any other value the state once that frame
+completed), for any `tick` from `0` to the current frontier:
+
+```json
+{"match_id":"duel-1","tick":4,"status":"running","state_hash":"<64 hex>",
+ "team_damage":{"blue":0,"red":10},
+ "units":[{"id":"red-1","team":"red","position":400,"velocity":5,
+           "health":90,"attacking":true,"alive":true}]}
+```
+
+`units` is the full unit list sorted by unit id, with the same fields as
+`GET /matches/{id}`.
+
+`GET /matches/{id}/deltas` returns the contiguous frames strictly after
+`after_tick` (the frame the caller already holds), at most `limit` of them;
+`limit` defaults to `1024` and must be an integer from `1` to `1024`:
+
+```json
+{"match_id":"duel-1","after_tick":4,"base_state_hash":"<64 hex>",
+ "next_tick":6,"complete":false,
+ "deltas":[{"tick":5,"state_hash":"<64 hex>","status":"running","settled":true,
+            "casualties":[],"team_damage":{"blue":0,"red":20},
+            "changed":[{"id":"red-1","team":"red","position":405,"velocity":5,
+                        "health":90,"attacking":true,"alive":true}]}]}
+```
+
+- `base_state_hash` is the hash at `after_tick`; each delta carries its `tick`,
+  `state_hash`, `status`, `settled`, `casualties`, the cumulative `team_damage`
+  and `changed`, the units whose public projection changed against the previous
+  frame, sorted by unit id and listed with their full new projection. An
+  `attacking`-only toggle and a death are changes too; a quiet tick has an
+  empty `changed`.
+- Applying the deltas in order to the snapshot at `after_tick` reproduces the
+  snapshot at `next_tick`; the service checks exactly this before answering.
+- `next_tick` is one past the last delta (equal to `after_tick` on an empty
+  page) and is the `after_tick` of the next call; `complete` is `true` only
+  when the page reached the current frontier.
+
+Both endpoints rebuild the requested history deterministically from the initial
+conditions and the stored input log and re-check every recorded frame hash: a
+frame gap, a hash mismatch or a delta page that does not rebuild its target
+snapshot fails the whole request with `integrity_failure` (409) instead of
+returning partial results. An unknown match is `not_found`; a missing or
+unknown query field, a non-integer or negative value or an out-of-range
+`limit` is a `validation_error`; a `tick` or `after_tick` ahead of the current
+frontier is a `conflict`.
+
 ### Roll back
 
 ```http
