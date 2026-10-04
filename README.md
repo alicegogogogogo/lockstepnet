@@ -461,14 +461,93 @@ visible tick is `conflict`.
   is checked.
 - A verifier derives all unit snapshots from `match.units` plus the frames.
 
+## Binary replay stream
+
+`src/replaystream.js` (also re-exported from `src/service.js`) provides three
+public entry points for exporting a confirmed timeline as a transferable byte
+stream and re-running it in another process: `ReplayWriter`, `ReplayReader`
+and `verifyReplay` (also exported as `VerifyReplay`). The format is
+self-describing: it records the format version, the tick configuration
+(`maxTicks`), the session seed, the first recorded frame, the participant
+identifiers, the initial state hash and, for every frame, the final inputs
+that were applied (payloads kept as raw bytes) and the resulting state hash.
+The layout is canonical, so the same initial conditions and the same final
+timeline encode to the same bytes no matter what order the inputs originally
+arrived in.
+
+```
+magic "LNRPLAY1" | major u16 | minor u16 | headerLength u32 |
+  seed u32 | maxTicks u32 | startFrame u32 | frameCount u32 |
+  initialStateHash 32B | participants (sorted, unique) | extensions (tagged) |
+  frameCount x { frame u32 | inputs (sorted by participant, raw payloads) |
+                 stateHash 32B } |
+  checksum 32B (sha256 of every preceding byte)
+```
+
+All integers are big-endian. Frames are contiguous from `startFrame`; a frame
+with no inputs is recorded and preserved. Unknown extension fields of a
+compatible (same-major) version are carried through and skipped.
+
+```js
+const { ReplayWriter, ReplayReader, verifyReplay } = require('./src/service');
+
+const writer = new ReplayWriter({
+  seed: 11, maxTicks: 64, startFrame: 1,
+  participants: ['red-1', 'blue-1'],
+  initialStateHash: '<64 hex>',
+});
+writer.writeFrame(1, [{ participant: 'red-1', payload: Buffer.from('...') }], hash1);
+writer.writeFrame(2, [], hash2);                 // zero-input frames are kept
+const bytes = writer.close();
+
+const reader = new ReplayReader(bytes);          // or await ReplayReader.fromStream(s)
+reader.metadata;                                 // version, seed, frame range, participants, ...
+for (const frame of reader.frames()) { /* { frame, inputs, stateHash } */ }
+
+const { finalFrame, stateHash } = verifyReplay(bytes, {
+  simulate(frame, inputs) { /* re-run one frame */ return newStateHash; },
+});
+```
+
+- The writer accepts only monotonically advancing confirmed frames: a
+  duplicate, out-of-order or gapped frame throws `ErrReplayFrameOrder`, and
+  writing after `close()` throws `ErrReplayClosed`. A rejected frame is
+  validated in full before anything is recorded, so it never leaves half a
+  record behind.
+- The reader validates the fixed identifier, format version, structural
+  boundaries and the whole-content checksum before exposing any frame, and
+  works on memory bytes or any readable stream - never the file system. Bad
+  identifiers, out-of-bounds fields, truncation, illegal frame sequences and
+  checksum mismatches throw `ErrReplayCorrupt`; an unsupported major version
+  throws `ErrReplayVersion`. Empty data, or a header without its trailer, is
+  corrupt; a failed read never yields a partially usable replay.
+- `verifyReplay` re-simulates from the recorded initial conditions in strict
+  frame order and compares every state hash. It returns the final frame
+  number and state hash, stops at the first mismatch with `ErrReplayDiverged`
+  (carrying `frame`, `expected` and `actual`), rejects an empty or
+  out-of-timeline range with `ErrReplayRange`, and rethrows a failing
+  `simulate` callback's own error untouched.
+- `Lockstep.exportReplay(matchId)` exports a stored match (the configuration
+  travels in a header extension) and `Lockstep.verifyReplayBytes(bytes)`
+  verifies such a stream against the engine, so a new process can validate
+  and replay it. Neither changes any existing behaviour: input
+  de-duplication, late-input rollback, snapshots, state hashes, sessions and
+  spectators are untouched, and callers that never use replay streams are
+  unaffected.
+
 ## Command line
 
 ```bash
 node src/cli.js verify --path replay.json [--database lockstepnet.db]
+node src/cli.js export --match duel-1 --path replay.lnr [--database lockstepnet.db]
+node src/cli.js verify-stream --path replay.lnr [--database lockstepnet.db]
 ```
 
-Prints the same verdict as `POST /matches/{id}/verify`. Exit code `0` means
-consistent, `1` means a mismatch and `2` means the document was rejected.
+`verify` prints the same verdict as `POST /matches/{id}/verify`. `export`
+writes the confirmed timeline of a stored match as a binary replay stream and
+`verify-stream` re-simulates such a stream from its embedded configuration.
+Exit code `0` means consistent, `1` means a mismatch and `2` means the input
+was rejected.
 
 ## Errors
 

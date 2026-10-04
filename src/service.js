@@ -3,6 +3,7 @@
 const { createHash } = require('node:crypto');
 const { ConflictError, IntegrityError, NotFoundError, ValidationError } = require('./errors');
 const replay = require('./replay');
+const replaystream = require('./replaystream');
 const sim = require('./sim');
 const { Store } = require('./store');
 
@@ -747,6 +748,76 @@ class Lockstep {
   }
 
   /**
+   * The confirmed timeline of a match as a self-describing binary replay
+   * stream (see replaystream.js for the format). The recorded frames are the
+   * final, already confirmed timeline, so the exported bytes depend only on
+   * the configuration and that timeline - never on the order the inputs
+   * originally arrived in. The match configuration travels in a header
+   * extension, so another process can verify the stream on its own.
+   */
+  exportReplay(matchId) {
+    const record = this.match(matchId);
+    const config = record.config;
+    const writer = new replaystream.ReplayWriter({
+      extensions: [{
+        tag: replaystream.EXTENSION_CONFIG,
+        value: canonicalJson({
+          id: config.id, max_ticks: config.maxTicks, seed: config.seed, units: config.units,
+        }),
+      }],
+      initialStateHash: sim.stateHash(sim.initialState(config)),
+      maxTicks: config.maxTicks,
+      participants: config.units.map((unit) => unit.id),
+      seed: config.seed,
+      startFrame: 1,
+    });
+    for (const frame of this.store.readFrames(matchId)) {
+      const inputs = frame.inputs.map((canonical) => ({
+        participant: sim.parseInputRecord(JSON.parse(canonical)).unit,
+        payload: canonical,
+      }));
+      writer.writeFrame(frame.tick, inputs, frame.state_hash);
+    }
+    return writer.close();
+  }
+
+  /**
+   * Verify a binary replay stream against the deterministic engine. The match
+   * configuration is read from the stream's configuration extension, the
+   * recorded initial state hash is checked against a fresh state, and every
+   * recorded frame is re-simulated in order. Returns the final verified frame
+   * and its state hash; a divergence, an invalid range or a corrupt stream
+   * surface as the corresponding replaystream error.
+   */
+  verifyReplayBytes(bytes, options = {}) {
+    const reader = new replaystream.ReplayReader(bytes);
+    const extension = reader.extension(replaystream.EXTENSION_CONFIG);
+    if (extension === null) {
+      throw new ValidationError('replay stream carries no match configuration extension');
+    }
+    let rawConfig;
+    try {
+      rawConfig = JSON.parse(extension.toString('utf8'));
+    } catch {
+      throw new ValidationError('replay stream match configuration is not valid JSON');
+    }
+    const config = sim.parseConfig(rawConfig);
+    const state = sim.initialState(config);
+    const result = replaystream.verifyReplay(reader, {
+      endFrame: options.endFrame,
+      initialStateHash: sim.stateHash(state),
+      simulate(frame, inputs) {
+        const records = inputs.map((input) => sim.parseInputRecord(JSON.parse(input.payload.toString('utf8'))));
+        records.sort(sim.compareInputs);
+        sim.applyTick(state, records);
+        return sim.stateHash(state);
+      },
+      startFrame: options.startFrame,
+    });
+    return { final_frame: result.finalFrame, match_id: config.id, state_hash: result.stateHash };
+  }
+
+  /**
    * `POST /matches/{id}/verify` accepts either `{"match_id": "..."}` to
    * re-simulate a stored match, or `{"replay": {...}}` for an uploaded replay.
    */
@@ -917,4 +988,4 @@ class Lockstep {
   }
 }
 
-module.exports = { Lockstep };
+module.exports = { Lockstep, ...replaystream };
