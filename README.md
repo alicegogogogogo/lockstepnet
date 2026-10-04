@@ -215,6 +215,86 @@ portable replay document (format below). `GET /matches/{id}/replay.stream`
 returns the same timeline as a self-describing replay byte stream
 (`application/octet-stream`, format in "Replay byte stream" below).
 
+### Historical snapshots and paged deltas
+
+Two read-only endpoints expose any confirmed frame of the *current* timeline.
+They take no `Idempotency-Key`, never advance a match and never change a
+counter or statistic. Tick `0` is the initial state; every other tick is the
+state *after* that frame completed.
+
+```http
+GET /matches/duel-1/snapshot?tick=4
+GET /matches/duel-1/deltas?after_tick=4&limit=1024
+```
+
+`GET /matches/{id}/snapshot?tick=N` requires an integer `tick` from `0` to the
+current frontier and returns:
+
+```json
+{
+  "match_id": "duel-1",
+  "tick": 4,
+  "status": "running",
+  "state_hash": "<64 hex>",
+  "team_damage": {"blue": 30, "red": 20},
+  "units": [
+    {"id":"blue-1","team":"blue","position":900,"velocity":-5,"health":80,"attacking":true,"alive":true}
+  ]
+}
+```
+
+`units` is the complete projection of every unit (including dead ones), sorted
+by unit id, using the same fields and order as `GET /matches/{id}`.
+
+`GET /matches/{id}/deltas?after_tick=N&limit=L` returns the contiguous frames
+strictly after the tick the caller already holds. `after_tick` must be an
+integer from `0` to the current frontier; `limit` defaults to `1024` and is an
+integer from `1` to `1024`.
+
+```json
+{
+  "match_id": "duel-1",
+  "after_tick": 4,
+  "base_state_hash": "<hash at tick 4>",
+  "next_tick": 6,
+  "complete": false,
+  "deltas": [
+    {
+      "tick": 5,
+      "state_hash": "<64 hex>",
+      "status": "running",
+      "settled": true,
+      "casualties": [],
+      "team_damage": {"blue": 40, "red": 20},
+      "changed": [
+        {"id":"red-1","team":"red","position":120,"velocity":5,"health":70,"attacking":false,"alive":true}
+      ]
+    }
+  ]
+}
+```
+
+- each `deltas` entry covers exactly one frame and lists in `changed` every
+  unit whose public fields differ from the previous frame, sorted by unit id,
+  each as the unit's complete post-frame projection. A unit that only toggles
+  `attacking`, and a unit that dies that frame, are both included; a frame with
+  no unit change still appears with an empty `changed`.
+- `settled` and `casualties` are the frame's settled flag and the units that
+  died during the frame; `team_damage` is the cumulative total after the frame.
+- applying the page to the `after_tick` snapshot - replacing each listed unit
+  with its projection and taking the last entry's `team_damage` - reproduces
+  the snapshot at `next_tick`, whose hash the page was checked against.
+- an empty page has `next_tick` equal to `after_tick`; `complete` is `true`
+  only when the page reaches the current frontier, otherwise the caller pages
+  again with the returned `next_tick`.
+
+Both endpoints rebuild the history deterministically from the stored input log
+and compare every recomputed state hash with the recorded one, so a frame gap,
+a hash mismatch or a delta page that fails to reduce to the snapshot fails the
+whole request with `integrity_failure` (409) instead of returning partial data.
+After a late input or an explicit rollback only the recomputed timeline is
+visible: frames beyond the new frontier are a `conflict`.
+
 The verify body may instead carry `{"replay":{...}}` with an uploaded document.
 Either form re-simulates the match from tick 0 and compares every recomputed state
 hash with the recorded one:

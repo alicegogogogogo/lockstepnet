@@ -73,7 +73,8 @@ function readOptionalBody(request) {
 function createHandler(service) {
   return async function handle(request, response) {
     try {
-      const parts = new URL(request.url, 'http://localhost').pathname.split('/').filter((part) => part.length > 0);
+      const url = new URL(request.url, 'http://localhost');
+      const parts = url.pathname.split('/').filter((part) => part.length > 0);
       const { method } = request;
       const key = request.headers['idempotency-key'];
 
@@ -97,6 +98,14 @@ function createHandler(service) {
         }
         if (method === 'GET' && parts.length === 3 && parts[2] === 'replay.stream') {
           sendBytes(response, 200, service.replayStream(id), 'application/octet-stream');
+          return;
+        }
+        if (method === 'GET' && parts.length === 3 && parts[2] === 'snapshot') {
+          send(response, 200, service.getSnapshot(id, url.searchParams));
+          return;
+        }
+        if (method === 'GET' && parts.length === 3 && parts[2] === 'deltas') {
+          send(response, 200, service.getDeltas(id, url.searchParams));
           return;
         }
         if (method === 'POST' && parts.length === 3 && parts[2] === 'inputs') {
