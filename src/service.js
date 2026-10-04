@@ -3,6 +3,7 @@
 const { createHash } = require('node:crypto');
 const { ConflictError, IntegrityError, NotFoundError, ValidationError } = require('./errors');
 const replay = require('./replay');
+const { ReplayReader, ReplayWriter, VerifyReplay } = require('./replaystream');
 const sim = require('./sim');
 const { Store } = require('./store');
 
@@ -747,6 +748,48 @@ class Lockstep {
   }
 
   /**
+   * The determined match timeline as a self-describing replay byte stream.
+   *
+   * The stream records the format version, the tick configuration, the seed,
+   * the start frame, the participant identifiers and the initial state hash,
+   * followed by every confirmed frame with the inputs that were finally
+   * applied (canonical JSON payloads, kept as raw bytes) and the resulting
+   * state hash. Frames are committed in strictly ascending tick order, so the
+   * exported bytes are a pure function of the initial conditions and the final
+   * timeline: two matches whose inputs arrived in different orders but settled
+   * to the same timeline export byte-identical streams.
+   */
+  replayStream(matchId) {
+    const record = this.match(matchId);
+    const config = record.config;
+    const frames = this.store.readFrames(matchId);
+    const writer = new ReplayWriter({
+      initialStateHash: sim.stateHash(sim.initialState(config)),
+      match: { id: config.id, max_ticks: config.maxTicks, seed: config.seed, units: config.units },
+      startFrame: frames.length === 0 ? 1 : frames[0].tick,
+    });
+    for (const frame of frames) {
+      writer.appendFrame({
+        inputs: frame.inputs.map((canonical) => ({
+          participant: JSON.parse(canonical).unit,
+          payload: canonical,
+        })),
+        stateHash: frame.state_hash,
+        tick: frame.tick,
+      });
+    }
+    return writer.finalize();
+  }
+
+  /**
+   * Verify a replay byte stream in this process: re-simulate it from the
+   * recorded initial conditions and compare every recorded state hash.
+   */
+  verifyReplayStream(source, options = {}) {
+    return VerifyReplay(source, options);
+  }
+
+  /**
    * `POST /matches/{id}/verify` accepts either `{"match_id": "..."}` to
    * re-simulate a stored match, or `{"replay": {...}}` for an uploaded replay.
    */
@@ -917,4 +960,4 @@ class Lockstep {
   }
 }
 
-module.exports = { Lockstep };
+module.exports = { Lockstep, ReplayReader, ReplayWriter, VerifyReplay };

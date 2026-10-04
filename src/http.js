@@ -54,6 +54,14 @@ function send(response, status, payload) {
   response.end(body);
 }
 
+function sendBytes(response, status, body, contentType) {
+  response.writeHead(status, {
+    'Content-Length': body.length,
+    'Content-Type': contentType,
+  });
+  response.end(body);
+}
+
 /** Read an optional JSON body: a request with no Content-Type carries no body. */
 function readOptionalBody(request) {
   if (request.headers['content-type'] === undefined) {
@@ -85,6 +93,10 @@ function createHandler(service) {
         }
         if (method === 'GET' && parts.length === 3 && parts[2] === 'replay') {
           send(response, 200, service.replayFile(id));
+          return;
+        }
+        if (method === 'GET' && parts.length === 3 && parts[2] === 'replay.stream') {
+          sendBytes(response, 200, service.replayStream(id), 'application/octet-stream');
           return;
         }
         if (method === 'POST' && parts.length === 3 && parts[2] === 'inputs') {

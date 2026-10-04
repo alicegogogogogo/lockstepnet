@@ -16,7 +16,9 @@ The initial release intentionally supports a compact public contract:
   a canonical order inside their tick, so arrival order cannot change the result;
 - every advanced tick records a frame carrying a sha256 state hash;
 - a late or out-of-order input triggers a rollback and recomputation;
-- a replay document can be verified by re-simulating it from tick 0.
+- a replay document can be verified by re-simulating it from tick 0;
+- a determined timeline can be exported as a self-describing replay byte
+  stream, transferred to another process and verified there.
 
 ## Requirements
 
@@ -199,6 +201,7 @@ hash of the last frame, and the simulation stops early if a team is eliminated.
 ```http
 GET  /matches/duel-1
 GET  /matches/duel-1/replay
+GET  /matches/duel-1/replay.stream
 POST /matches/duel-1/verify
 Idempotency-Key: verify-1
 
@@ -208,7 +211,9 @@ Idempotency-Key: verify-1
 `GET /matches/{id}` returns the current match state; its `units` list every unit
 with `id`, `team`, `position`, `velocity`, `health`, `attacking` and `alive`,
 sorted by unit id. `GET /matches/{id}/replay` returns the whole match as a
-portable replay document (format below).
+portable replay document (format below). `GET /matches/{id}/replay.stream`
+returns the same timeline as a self-describing replay byte stream
+(`application/octet-stream`, format in "Replay byte stream" below).
 
 The verify body may instead carry `{"replay":{...}}` with an uploaded document.
 Either form re-simulates the match from tick 0 and compares every recomputed state
@@ -460,6 +465,76 @@ visible tick is `conflict`.
   records and the frame ticks and hashes. It is optional on input: when present it
   is checked.
 - A verifier derives all unit snapshots from `match.units` plus the frames.
+
+### Replay byte stream
+
+`GET /matches/{id}/replay.stream` returns the determined match timeline as a
+self-describing byte stream (`application/octet-stream`). The same three public
+entry points are available from `src/replaystream.js` (and re-exported from
+`src/service.js`) so a stream can be produced, read and verified without a
+database or a file system:
+
+```js
+const { ReplayWriter, ReplayReader, VerifyReplay } = require('./src/replaystream');
+
+// recording: only monotonically advancing confirmed frames are accepted
+const writer = new ReplayWriter({ match, initialStateHash, startFrame: 1 });
+writer.appendFrame({ tick: 1, stateHash, inputs: [{ participant, payload }] });
+const bytes = writer.finalize();
+
+// reading: full validation first, then metadata and per-frame iteration
+const reader = await ReplayReader.open(bytes); // bytes or a readable stream
+for (const frame of reader) { /* frame.tick, frame.stateHash, frame.inputs */ }
+
+// verifying: re-simulate from the recorded initial conditions
+const { finalFrame, finalStateHash } = await VerifyReplay(bytes);
+```
+
+The stream layout (format version 1) is:
+
+```
+header  := "LSNRPLY1" version(uint16 LE) header_length(uint32 LE) header_json
+frame   := tick(uint32 LE) body_length(uint32 LE) body
+body    := input_count(uint16 LE) inputs... state_hash(32 bytes) [extension]
+input   := participant_index(uint16 LE) payload_length(uint32 LE) payload
+trailer := frame_count(uint32 LE) checksum(32 bytes, sha256 of all prior bytes)
+```
+
+- The JSON header records the format version, the tick configuration
+  (`max_ticks`), the `seed`, the `start_frame`, the sorted `participants`, the
+  `initial_state_hash` and the match configuration the verifier re-simulates
+  from. Input payloads are kept as raw bytes (the canonical input JSON).
+- Inputs inside a frame are sorted by stable participant identifier, so the
+  exported bytes are a pure function of the initial conditions and the final
+  timeline: two matches whose inputs arrived in different orders but settled
+  to the same timeline export byte-identical streams.
+- `ReplayWriter.appendFrame` validates a frame completely before committing
+  it, so a rejected frame never leaves half a record. A duplicate or
+  out-of-order tick raises `ErrReplayFrameOrder`; a write after `finalize`
+  raises `ErrReplayClosed`.
+- `ReplayReader` validates the fixed identifier, the format version, every
+  structural boundary and the whole-stream checksum before exposing any frame.
+  Bad magic, out-of-bounds fields, truncation, an illegal frame sequence or a
+  checksum mismatch raise `ErrReplayCorrupt`; an unsupported format version
+  raises `ErrReplayVersion`. Empty input and a header without a complete
+  trailer are corrupt, and a failed validation never yields a partially usable
+  replay. Zero-input frames are preserved, and unknown extension fields of a
+  compatible version (extra header keys, trailing frame-body bytes) are
+  skipped safely.
+- `VerifyReplay(source, { startFrame, endFrame, simulate })` advances strictly
+  by the recorded frame numbers, feeds each frame's inputs to the
+  deterministic simulation and compares state hashes. When every frame
+  matches it resolves to `{ finalFrame, finalStateHash, framesVerified }`;
+  the first mismatch raises `ErrReplayDiverged` carrying the diverging
+  `frame`, the recorded `expectedHash` and the recomputed `actualHash`. An end
+  frame before the start frame or outside the recorded range raises
+  `ErrReplayRange`. An error thrown by a custom `simulate` callback is
+  propagated unchanged - never reclassified as corruption or divergence.
+
+None of this touches input de-duplication, out-of-order handling, late-input
+rollback, snapshots or state hashes: existing callers keep working without
+configuring anything, and an unknown replay version has no effect on ordinary
+session operation.
 
 ## Command line
 
